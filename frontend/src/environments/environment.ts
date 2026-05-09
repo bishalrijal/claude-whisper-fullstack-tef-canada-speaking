@@ -7,6 +7,7 @@ export type FlashcardTtsMode = 'api' | 'browser';
 export const environment = {
   production: false,
   apiUrl: 'http://localhost:3000',
+  wsPath: '/socket.io',
   /**
    * Owner-only (you edit this before `ng serve` / deploy — learners cannot change it):
    * - `api` → POST /tts (OpenAI on your backend)
