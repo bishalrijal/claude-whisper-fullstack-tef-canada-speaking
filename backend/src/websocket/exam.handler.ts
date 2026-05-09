@@ -131,7 +131,9 @@ export function registerExamNamespace(httpServer: Server): void {
     SocketData
   >(httpServer, {
     cors: {
-      origin: 'http://localhost:4200',
+      // APP_URL holds the frontend origin (set in .env / docker env).
+      // Falls back to localhost for local dev without a configured APP_URL.
+      origin: process.env['APP_URL'] ?? 'http://localhost:4200',
       credentials: true,
     },
   });

@@ -67,10 +67,15 @@ export class ExamSocketService {
   readonly examEnded$ = new Subject<ExamEndedEvent>();
   readonly wsError$ = new Subject<{ message: string }>();
 
-  connect(apiUrl: string): void {
+  connect(apiUrl: string, wsPath: string): void {
     if (this.socket?.connected) return;
 
-    this.socket = io(`${apiUrl}/exam`, {
+    // In dev:  apiUrl = 'http://localhost:3000' (absolute) → use directly as WS server
+    // In prod: apiUrl = '/api' (relative)        → connect to current page origin instead
+    const wsOrigin = apiUrl.startsWith('http') ? apiUrl : window.location.origin;
+
+    this.socket = io(`${wsOrigin}/exam`, {
+      path: wsPath,
       withCredentials: true,
       transports: ['websocket'],
     });

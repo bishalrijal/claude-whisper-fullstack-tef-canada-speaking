@@ -94,7 +94,7 @@ export class Exam implements OnInit, OnDestroy {
     );
 
     // Connect WebSocket early so the handshake completes before the user presses Start
-    this.examSocket.connect(environment.apiUrl);
+    this.examSocket.connect(environment.apiUrl, environment.wsPath);
     this.registerSocketEvents();
 
     this.loadScenarioPreview(nav.section);
