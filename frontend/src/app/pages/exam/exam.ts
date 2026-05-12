@@ -4,6 +4,7 @@ import { Store } from '@ngrx/store';
 import { Router } from '@angular/router';
 import { AttemptService } from '../../services/attempt';
 import { ExamSocketService } from '../../services/exam-socket.service';
+import { ExamRealtimeService } from '../../services/exam-realtime.service';
 import type { DeliverySnapshot } from '../../services/exam-socket.service';
 import { environment } from '../../../environments/environment';
 import { AppShellHeaderComponent } from '../../shared/components/app-shell-header/app-shell-header.component';
@@ -38,6 +39,7 @@ export class Exam implements OnInit, OnDestroy {
   private store = inject(Store);
   private attemptService = inject(AttemptService);
   private examSocket = inject(ExamSocketService);
+  private examRealtime = inject(ExamRealtimeService);
 
   // Exam metadata
   section = signal<'A' | 'B'>('A');
@@ -112,7 +114,42 @@ export class Exam implements OnInit, OnDestroy {
 
         await this.playBase64Audio(data.openingAudio);
         this.startTimer();
-        await this.startListening();
+
+        try {
+          await this.examRealtime.connect(data.realtime.clientSecret, {
+            onCandidateTranscript: (text) => {
+              if (this.examEnded) return;
+              this.history.push({ role: 'candidate', content: text });
+              this.state.set('listening');
+            },
+            onExaminerAudioStart: () => {
+              if (this.examEnded) return;
+              // First audio chunk just arrived — mute mic NOW before echo builds up.
+              // setMicMuted stops all audio reaching OpenAI, so the VAD has nothing
+              // to trigger on regardless — no session.update needed.
+              this.examRealtime.setMicMuted(true);
+              this.examRealtime.clearInputBuffer();
+              this.state.set('ai-speaking');
+            },
+            onExaminerTranscript: (text) => {
+              if (this.examEnded) return;
+              // Audio is done by the time this fires — just update the transcript display.
+              this.history.push({ role: 'examiner', content: text });
+            },
+            onResponseDone: () => {
+              if (this.examEnded) return;
+              // Full response finished — unmute mic so candidate can respond.
+              this.examRealtime.setMicMuted(false);
+              this.state.set('listening');
+            },
+            onError: (message) => {
+              this.error.set(message);
+            },
+          });
+          if (!this.examEnded) this.state.set('listening');
+        } catch {
+          this.error.set('Could not start voice session');
+        }
       }),
     );
 
@@ -182,6 +219,7 @@ export class Exam implements OnInit, OnDestroy {
 
   ngOnDestroy() {
     this.wsSubscription.unsubscribe();
+    this.examRealtime.disconnect();
     this.examSocket.disconnect();
     this.cleanup();
   }
@@ -261,10 +299,11 @@ export class Exam implements OnInit, OnDestroy {
 
   endExam(reason: 'timeout' | 'user_terminated') {
     this.examEnded = true;
+    this.examRealtime.disconnect();
     this.stopListening();
     this.stopTimer();
     this.state.set('evaluating');
-    this.examSocket.endExam(reason);
+    this.examSocket.endExam(reason, this.history);
     // Navigate happens in the examEnded$ subscription handler
   }
 

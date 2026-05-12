@@ -1,4 +1,5 @@
 import type { DeliverySnapshot } from '../services/delivery-metrics.js';
+import type { Turn } from '../services/examiner.service.js';
 
 // ── Client → Server ────────────────────────────────────────────────────────
 
@@ -9,6 +10,8 @@ export type StartExamPayload = {
 
 export type EndExamPayload = {
   reason: 'timeout' | 'user_terminated';
+  /** Browser-authoritative transcript for GPT Realtime exams (server VAD + WebRTC). */
+  history?: Turn[];
 };
 
 // audio_submit is sent as a raw binary ArrayBuffer/Buffer — no wrapper type needed
@@ -21,6 +24,8 @@ export type ExamStartedEvent = {
   scenarioImageUrl: string;
   openingText: string;
   openingAudio: string; // base64 opus
+  /** Short-lived secret for browser WebRTC to `wss://api.openai.com` /realtime/calls. */
+  realtime: { clientSecret: string; expiresAt: number };
 };
 
 export type TranscriptEvent = {

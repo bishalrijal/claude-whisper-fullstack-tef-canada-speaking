@@ -128,6 +128,30 @@ export async function* streamExaminerSentences(
   if (final.length > 2) yield final;
 }
 
+/**
+ * Full examiner instructions for OpenAI Realtime (`session.instructions`).
+ * Combines the same rules as the Claude examiner, domain vocabulary (`whisperHint`),
+ * and the opening line the candidate already heard (so the model continues naturally).
+ *
+ * LEARN: Realtime uses one `instructions` string rather than a separate Chat Completions `system` message.
+ */
+export function buildRealtimeInstructions(
+  scenario: SectionAScenario | SectionBScenario,
+  section: 'A' | 'B',
+  openingSpokenToCandidate: string,
+): string {
+  const base = buildSystemPrompt(scenario, section);
+  const vocabAndOpening = `
+---
+DOMAIN VOCABULARY AND TRANSCRIPTION HINTS (expect these words and phrases; the candidate may use different accents or approximate French):
+${scenario.whisperHint}
+---
+OPENING LINE (you already said this aloud to the candidate at the start of the call; they heard it; continue naturally — do not repeat it verbatim unless they ask):
+${openingSpokenToCandidate.trim()}
+`.trim();
+  return `${base}\n\n${vocabAndOpening}`;
+}
+
 function buildSystemPrompt(scenario: SectionAScenario | SectionBScenario, section: 'A' | 'B'): string {
   const base = `
 ${scenario.context}

@@ -2,11 +2,8 @@ import type { Server } from 'http';
 import { writeFile } from 'fs/promises';
 import { Server as SocketIOServer, type Socket } from 'socket.io';
 import { sessionRepository } from '../repositories/session.repository.js';
-import {
-  startAttempt,
-  streamTurn,
-  finishAttempt,
-} from '../services/attempt.service.js';
+import { startAttempt, streamTurn, finishAttempt } from '../services/attempt.service.js';
+import { createExamRealtimeClientSecret } from '../services/realtime-session.service.js';
 import { ExamSession } from './exam.session.js';
 import type {
   ServerToClientEvents,
@@ -37,6 +34,13 @@ async function handleStartExam(
 ): Promise<ExamSession> {
   const result = await startAttempt(payload.section, payload.scenarioId);
 
+  // Ephemeral token + server-built instructions (persona + whisperHint + opening) for WebRTC.
+  const { value, expires_at } = await createExamRealtimeClientSecret({
+    userId,
+    section: result.section,
+    scenarioId: result.scenarioId,
+  });
+
   const session = new ExamSession({
     userId,
     attemptId: result.attemptId,
@@ -51,6 +55,7 @@ async function handleStartExam(
     scenarioImageUrl: result.scenarioImageUrl,
     openingText: result.openingText,
     openingAudio: result.openingAudio.toString('base64'),
+    realtime: { clientSecret: value, expiresAt: expires_at },
   });
 
   return session;
@@ -105,14 +110,17 @@ async function handleAudioTurn(
 async function handleEndExam(
   socket: ExamSocket,
   session: ExamSession,
-  reason: 'timeout' | 'user_terminated',
+  payload: EndExamPayload,
 ): Promise<void> {
+  const history =
+    payload.history && payload.history.length > 0 ? payload.history : session.history;
+
   const result = await finishAttempt(
     session.userId,
-    session.history,
+    history,
     [session.section],
     session.scenarioId,
-    reason,
+    payload.reason,
     session.candidateDeliveryLog,
   );
 
@@ -203,7 +211,7 @@ export function registerExamNamespace(httpServer: Server): void {
       const session = examSession;
       examSession = null;
       try {
-        await handleEndExam(typedSocket, session, payload.reason);
+        await handleEndExam(typedSocket, session, payload);
       } catch {
         typedSocket.emit('error', { message: 'Failed to finish exam' });
       }

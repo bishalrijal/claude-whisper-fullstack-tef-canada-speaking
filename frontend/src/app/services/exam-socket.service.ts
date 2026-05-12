@@ -13,12 +13,16 @@ export type DeliverySnapshot = {
   wordsPerMinute: number | null;
 };
 
+export type Turn = { role: 'examiner' | 'candidate'; content: string };
+
 export type ExamStartedEvent = {
   attemptId: string;
   scenarioId: string;
   scenarioImageUrl: string;
   openingText: string;
   openingAudio: string; // base64 opus
+  /** Short-lived `ek_…` for browser WebRTC to OpenAI Realtime */
+  realtime: { clientSecret: string; expiresAt: number };
 };
 
 export type TranscriptEvent = {
@@ -101,7 +105,7 @@ export class ExamSocketService {
     blob.arrayBuffer().then(buf => this.socket?.emit('audio_submit', buf));
   }
 
-  endExam(reason: 'timeout' | 'user_terminated'): void {
-    this.socket?.emit('end_exam', { reason });
+  endExam(reason: 'timeout' | 'user_terminated', history?: Turn[]): void {
+    this.socket?.emit('end_exam', { reason, ...(history?.length ? { history } : {}) });
   }
 }
