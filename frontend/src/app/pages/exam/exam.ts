@@ -14,7 +14,7 @@ type Turn = { role: 'examiner' | 'candidate'; content: string };
 
 const EXAM_DURATION_SECONDS = 5 * 60;
 const SILENCE_THRESHOLD = 12;
-const SILENCE_DURATION_MS = 1800;
+const SILENCE_DURATION_MS = 1200;
 const MIN_SPEECH_FRAMES = 4;
 
 /** Build absolute URL for scenario images — handles `/assets/…` from API and avoids double slashes. */

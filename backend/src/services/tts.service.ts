@@ -5,33 +5,54 @@ const openai = new OpenAI({ apiKey: getEnv().openAiApiKey });
 
 export type TtsLang = 'fr' | 'en';
 
+// ── In-memory LRU cache ────────────────────────────────────────────────────────
+// Scenario openings, closing lines, and short examiner phrases repeat frequently.
+// Caching them avoids redundant API calls and makes those turns instant.
+const CACHE_MAX = 120;
+const cache = new Map<string, Buffer>();
+
+function cacheGet(key: string): Buffer | undefined {
+  const hit = cache.get(key);
+  if (hit) {
+    cache.delete(key);
+    cache.set(key, hit);
+  }
+  return hit;
+}
+
+function cacheSet(key: string, audio: Buffer): void {
+  if (cache.size >= CACHE_MAX) {
+    const oldest = cache.keys().next().value;
+    if (oldest !== undefined) cache.delete(oldest);
+  }
+  cache.set(key, audio);
+}
+
 /**
- * Converts text to speech using OpenAI TTS.
- * Returns a Buffer of MP3 audio data — sent directly to the frontend.
+ * Converts text to speech using OpenAI tts-1.
  *
- * Model: 'gpt-4o-mini-tts' — accepts `instructions` for accent/register (not available on tts-1).
- * Voice: 'coral' — works for both FR and EN flashcard playback.
- *
- * LEARN: the Angular client caches MP3s in IndexedDB per text+lang; if you change model/voice/instructions in a material way,
- * bump the SCHEMA string in `frontend/.../tts-clip-cache.ts` so old blobs are not reused under the same key.
+ * tts-1 is the stable, reliable model — consistent 1–2 s latency with no hangs.
+ * Results are cached in an LRU store so repeated phrases (openings, closings,
+ * short examiner replies) are served instantly without an API call.
  */
 export async function textToSpeech(text: string, lang: TtsLang = 'fr'): Promise<Buffer> {
-  const instructions =
-    lang === 'fr'
-      ? 'Parle en français avec un accent français naturel. Ton clair et professionnel. Rythme naturel.'
-      : 'Speak in clear English with a neutral accent suitable for language learners. Natural pace, friendly tutor tone.';
+  const key = `${lang}:${text}`;
 
-  const speed = lang === 'fr' ? 1.15 : 1.05;
+  const hit = cacheGet(key);
+  if (hit) {
+    console.log(`[tts] cache hit "${text.slice(0, 40)}"`);
+    return hit;
+  }
 
-  const response = await openai.audio.speech.create({
-    model: 'gpt-4o-mini-tts',
+  const res = await openai.audio.speech.create({
+    model: 'tts-1',
     voice: 'coral',
     input: text,
     response_format: 'opus',
-    speed,
-    instructions,
+    speed: lang === 'fr' ? 1.15 : 1.05,
   });
 
-  const arrayBuffer = await response.arrayBuffer();
-  return Buffer.from(arrayBuffer);
+  const audio = Buffer.from(await res.arrayBuffer());
+  cacheSet(key, audio);
+  return audio;
 }

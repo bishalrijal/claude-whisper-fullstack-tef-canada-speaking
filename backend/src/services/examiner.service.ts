@@ -50,18 +50,16 @@ export async function getExaminerResponse(
   history: Turn[],
   section: 'A' | 'B',
 ): Promise<string> {
-  const systemPrompt = buildSystemPrompt(scenario, section);
-
-  // LEARN: Claude uses 'user' and 'assistant' roles — we translate our domain language to match.
-  const messages: Anthropic.MessageParam[] = history.map(turn => ({
+  const messages: Anthropic.Beta.Messages.BetaMessageParam[] = history.map(turn => ({
     role: turn.role === 'candidate' ? 'user' : 'assistant',
     content: turn.content,
   }));
 
-  const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-5',
+  const response = await anthropic.beta.messages.create({
+    model: 'claude-haiku-4-5-20251001',
     max_tokens: 80,
-    system: systemPrompt,
+    betas: ['prompt-caching-2024-07-31'],
+    system: [{ type: 'text', text: buildSystemPrompt(scenario, section), cache_control: { type: 'ephemeral' } }],
     messages,
   });
 
@@ -91,21 +89,18 @@ export async function* streamExaminerSentences(
 ): AsyncGenerator<string> {
   const systemPrompt = buildSystemPrompt(scenario, section);
 
-  const messages: Anthropic.MessageParam[] = history.map(turn => ({
+  const messages: Anthropic.Beta.Messages.BetaMessageParam[] = history.map(turn => ({
     role: turn.role === 'candidate' ? 'user' : 'assistant',
     content: turn.content,
   }));
 
   let buffer = '';
 
-  // anthropic.messages.stream() opens a streaming connection to Claude.
-  // Instead of one big response, we receive text token-by-token via MessageStreamEvent objects.
-  // LEARN: The stream is an AsyncIterable<MessageStreamEvent>. We iterate it with for-await
-  //   and narrow to 'content_block_delta' + 'text_delta' to extract text chunks.
-  const stream = anthropic.messages.stream({
-    model: 'claude-sonnet-4-5',
-    max_tokens: 80,  // 1-3 spoken sentences for a phone call reply
-    system: systemPrompt,
+  const stream = anthropic.beta.messages.stream({
+    model: 'claude-haiku-4-5-20251001',
+    max_tokens: 80,
+    betas: ['prompt-caching-2024-07-31'],
+    system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
     messages,
   });
 

@@ -190,7 +190,8 @@ export function registerExamNamespace(httpServer: Server): void {
       turnInProgress = true;
       try {
         await handleAudioTurn(typedSocket, examSession, Buffer.from(audioBuffer));
-      } catch {
+      } catch (err) {
+        console.error('[turn] handleAudioTurn failed:', err);
         typedSocket.emit('error', { message: 'Failed to process audio' });
       } finally {
         turnInProgress = false;

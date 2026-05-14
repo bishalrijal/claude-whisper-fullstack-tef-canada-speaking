@@ -18,12 +18,12 @@ export type TranscriptionResult = {
 };
 
 /**
- * Transcribes an audio file to French text using OpenAI Whisper.
+ * Transcribes an audio file to French text using gpt-4o-transcribe.
  *
  * @param filePath - absolute path to the audio file saved by multer
  * @param scenarioHint - a short French phrase describing the call context.
- *   Whisper uses this as a vocabulary/context primer — it dramatically improves
- *   accuracy for domain-specific words (club names, services, French phone phrases).
+ *   Used as a vocabulary/context primer — it improves accuracy for domain-specific
+ *   words (club names, services, French phone phrases).
  * @returns text + delivery metrics, or null if the audio was silent/empty
  */
 export async function transcribeAudio(
@@ -38,32 +38,27 @@ export async function transcribeAudio(
     const { size } = fs.statSync(filePath);
     if (size < 4096) return null;
 
-    // LEARN: `verbose_json` returns `text`, `duration`, and `segments` with timestamps —
-    // we use those gaps to estimate pauses for grading (coherence / fluency).
+    // gpt-4o-transcribe does not support verbose_json — use json (text only, no segments).
+    // Delivery timing metrics (pauses, WPM) will be null/zero for this model.
     const response = await openai.audio.transcriptions.create({
       file: fs.createReadStream(filePath),
-      model: 'whisper-1',
+      model: 'gpt-4o-transcribe',
       language: 'fr',
-      response_format: 'verbose_json',
+      response_format: 'json',
       prompt: scenarioHint
         ?? "Conversation téléphonique en français. L'appelant pose des questions à un interlocuteur professionnel.",
     });
 
-    const verbose = response as unknown as {
-      text?: string;
-      duration?: number;
-      segments?: Array<{ start: number; end: number }>;
-    };
+    const transcript = (response.text ?? '').trim();
 
-    const transcript = (verbose.text ?? '').trim();
-
-    // Whisper sometimes returns empty string, just punctuation, or filler like "..."
+    // gpt-4o-transcribe sometimes returns empty string, just punctuation, or filler like "..."
     // for near-silent audio. Treat anything under 3 meaningful characters as empty
     // so we don't send noise to Claude.
     const meaningful = transcript.replace(/[.,!?…\s]/g, '');
     if (meaningful.length < 3) return null;
 
-    const delivery = buildDeliverySnapshotFromVerbose(verbose);
+    // No segment/duration data available with json format — snapshot has words only.
+    const delivery = buildDeliverySnapshotFromVerbose({ text: transcript });
 
     return { text: transcript, delivery };
   } finally {

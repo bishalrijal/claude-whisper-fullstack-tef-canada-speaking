@@ -160,34 +160,39 @@ export async function* streamTurn(
   const scenario = scenarios.find(s => s.id === scenarioId);
   if (!scenario) throw new Error(`Unknown scenarioId: ${scenarioId}`);
 
+  const turnIndex = Math.ceil(history.length / 2) + 1;
+  const t0 = performance.now();
+
   // Step 1: transcribe — we must have the full transcript before Claude can respond
+  const whisperStart = performance.now();
   const transcription = await transcribeAudio(audioFilePath, scenario.whisperHint);
+  const whisperMs = Math.round(performance.now() - whisperStart);
+
   if (!transcription) {
+    console.log(`[perf] turn #${turnIndex} — whisper: ${whisperMs} ms → skipped (silence)`);
     yield { type: 'skipped' };
     return;
   }
   const { text: transcript, delivery } = transcription;
-  // Emit immediately so the frontend can update the transcript UI right away
   yield { type: 'transcript', text: transcript, delivery };
 
   // Step 2 + 3 interleaved: stream Claude sentence by sentence, TTS each one immediately.
-  // updatedHistory includes the candidate's latest turn so Claude has full context.
   const updatedHistory: Turn[] = [
     ...history,
     { role: 'candidate', content: transcript },
   ];
 
-  // True pipeline: fire TTS the moment each sentence arrives from Claude,
-  // and yield each audio chunk as soon as its TTS resolves — without waiting
-  // for Claude to finish the whole response first.
-  //
-  // The consumer (WebSocket handler) receives sentence 1 audio as soon as
-  // TTS 1 is ready, while Claude is still generating sentence 2 and TTS 2
-  // is already running in parallel.
-  type PipelineItem = { sentence: string; audioPromise: Promise<Buffer> };
+  type PipelineItem = {
+    sentence: string;
+    audioPromise: Promise<Buffer>;
+    claudeEnqueuedAt: number;
+  };
+
   const queue: PipelineItem[] = [];
+  const sentenceRows: Array<{ text: string; claudeMs: number; ttsMs: number; emittedAt: number }> = [];
   let claudeDone = false;
   let notify: (() => void) | null = null;
+  const claudeStart = performance.now();
 
   function wake(): void {
     const fn = notify;
@@ -195,29 +200,58 @@ export async function* streamTurn(
     fn?.();
   }
 
-  // Runs Claude stream in the background, pushing TTS promises as each sentence arrives.
   const claudeStream = (async () => {
     for await (const sentence of streamExaminerSentences(scenario, updatedHistory, section)) {
-      queue.push({ sentence, audioPromise: textToSpeech(sentence) });
+      queue.push({ sentence, audioPromise: textToSpeech(sentence), claudeEnqueuedAt: performance.now() });
       wake();
     }
     claudeDone = true;
     wake();
   })();
 
-  // Consume queue items in order, yielding each as soon as its TTS resolves.
   let i = 0;
   while (!claudeDone || i < queue.length) {
     if (i >= queue.length) {
       await new Promise<void>(r => { notify = r; });
     }
     if (i >= queue.length) continue;
-    const { sentence, audioPromise } = queue[i++]!;
-    const audio = await audioPromise;
-    yield { type: 'audio', sentenceText: sentence, base64: audio.toString('base64') };
+    const item = queue[i++]!;
+    const ttsStart = performance.now();
+    const audio = await item.audioPromise;
+    const ttsMs = Math.round(performance.now() - ttsStart);
+    const emittedAt = Math.round(performance.now() - t0);
+    sentenceRows.push({
+      text: item.sentence.slice(0, 40),
+      claudeMs: Math.round(item.claudeEnqueuedAt - claudeStart),
+      ttsMs,
+      emittedAt,
+    });
+    yield { type: 'audio', sentenceText: item.sentence, base64: audio.toString('base64') };
   }
 
-  await claudeStream; // surface any errors from the background producer
+  await claudeStream;
+
+  const totalMs = Math.round(performance.now() - t0);
+  const claudeTotalMs = sentenceRows.length > 0
+    ? Math.max(...sentenceRows.map(r => r.claudeMs))
+    : 0;
+
+  // Structured timing report — one block per turn for easy log scanning
+  const lines = [
+    `[perf] ── Turn #${turnIndex} timing ──────────────────────────────────`,
+    `  Whisper (STT):          ${String(whisperMs).padStart(5)} ms`,
+    `  Claude first sentence:  ${String(sentenceRows[0]?.claudeMs ?? 0).padStart(5)} ms  (after Whisper)`,
+    `  Claude total stream:    ${String(claudeTotalMs).padStart(5)} ms  (after Whisper)`,
+  ];
+  for (let j = 0; j < sentenceRows.length; j++) {
+    const r = sentenceRows[j]!;
+    lines.push(`  Sentence ${j + 1}  "${r.text}${r.text.length === 40 ? '…' : ''}"`);
+    lines.push(`    ├─ Claude enqueued: ${String(r.claudeMs).padStart(5)} ms`);
+    lines.push(`    └─ TTS:            ${String(r.ttsMs).padStart(5)} ms  → emitted at ${r.emittedAt} ms`);
+  }
+  lines.push(`  Total turn:             ${String(totalMs).padStart(5)} ms`);
+  lines.push(`  ─────────────────────────────────────────────────────────`);
+  console.log(lines.join('\n'));
 
   yield { type: 'done' };
 }
