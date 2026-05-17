@@ -1,8 +1,7 @@
 import type { Server } from 'http';
-import { writeFile } from 'fs/promises';
 import { Server as SocketIOServer, type Socket } from 'socket.io';
 import { sessionRepository } from '../repositories/session.repository.js';
-import { startAttempt, streamTurn, finishAttempt } from '../services/attempt.service.js';
+import { startAttempt, finishAttempt } from '../services/attempt.service.js';
 import { createExamRealtimeClientSecret } from '../services/realtime-session.service.js';
 import { ExamSession } from './exam.session.js';
 import type {
@@ -10,8 +9,11 @@ import type {
   ClientToServerEvents,
   SocketData,
   StartExamPayload,
+  TranscriptUpdatePayload,
   EndExamPayload,
 } from './exam.types.js';
+
+
 
 type ExamSocket = Socket<ClientToServerEvents, ServerToClientEvents, Record<string, never>, SocketData>;
 
@@ -61,63 +63,16 @@ async function handleStartExam(
   return session;
 }
 
-async function handleAudioTurn(
-  socket: ExamSocket,
-  session: ExamSession,
-  audioBuffer: Buffer,
-): Promise<void> {
-  const tmpPath = `/tmp/ws_audio_${Date.now()}_${Math.random().toString(36).slice(2)}.webm`;
-  await writeFile(tmpPath, audioBuffer);
-
-  let examinerAccumText = '';
-
-  // streamTurn internally deletes the temp file after Whisper transcription
-  for await (const event of streamTurn(
-    tmpPath,
-    session.history,
-    session.section,
-    session.scenarioId,
-  )) {
-    switch (event.type) {
-      case 'skipped':
-        socket.emit('turn_done', { skipped: true });
-        return;
-
-      case 'transcript':
-        session.history.push({ role: 'candidate', content: event.text });
-        session.candidateDeliveryLog.push(event.delivery);
-        socket.emit('transcript', { text: event.text, delivery: event.delivery });
-        break;
-
-      case 'audio':
-        examinerAccumText += (examinerAccumText ? ' ' : '') + event.sentenceText;
-        socket.emit('examiner_sentence', {
-          sentenceText: event.sentenceText,
-          audio: event.base64,
-        });
-        break;
-
-      case 'done':
-        if (examinerAccumText) {
-          session.history.push({ role: 'examiner', content: examinerAccumText });
-        }
-        socket.emit('turn_done', { skipped: false });
-        break;
-    }
-  }
-}
-
 async function handleEndExam(
   socket: ExamSocket,
   session: ExamSession,
   payload: EndExamPayload,
 ): Promise<void> {
-  const history =
-    payload.history && payload.history.length > 0 ? payload.history : session.history;
+  console.log(`[exam] end_exam reason=${payload.reason} history=${session.history.length} turns`);
 
   const result = await finishAttempt(
     session.userId,
-    history,
+    session.history,
     [session.section],
     session.scenarioId,
     payload.reason,
@@ -183,7 +138,6 @@ export function registerExamNamespace(httpServer: Server): void {
   exam.on('connection', (socket) => {
     const typedSocket = socket as unknown as ExamSocket;
     let examSession: ExamSession | null = null;
-    let turnInProgress = false;
 
     socket.on('start_exam', async (payload) => {
       try {
@@ -193,16 +147,23 @@ export function registerExamNamespace(httpServer: Server): void {
       }
     });
 
-    socket.on('audio_submit', async (audioBuffer) => {
-      if (!examSession || turnInProgress) return;
-      turnInProgress = true;
+    socket.on('transcript_update', (payload: TranscriptUpdatePayload) => {
+      if (!examSession) return;
+      examSession.history.push({ role: payload.role, content: payload.content });
+      console.log(`[exam] transcript_update role=${payload.role} len=${payload.content.length} history=${examSession.history.length}`);
+    });
+
+    socket.on('token_refresh', async () => {
+      if (!examSession) return;
       try {
-        await handleAudioTurn(typedSocket, examSession, Buffer.from(audioBuffer));
-      } catch (err) {
-        console.error('[turn] handleAudioTurn failed:', err);
-        typedSocket.emit('error', { message: 'Failed to process audio' });
-      } finally {
-        turnInProgress = false;
+        const { value, expires_at } = await createExamRealtimeClientSecret({
+          userId: examSession.userId,
+          section: examSession.section,
+          scenarioId: examSession.scenarioId,
+        });
+        typedSocket.emit('token_refreshed', { clientSecret: value, expiresAt: expires_at });
+      } catch {
+        typedSocket.emit('error', { message: 'Failed to refresh session token' });
       }
     });
 

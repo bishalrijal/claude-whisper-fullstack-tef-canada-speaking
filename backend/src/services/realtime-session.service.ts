@@ -53,14 +53,13 @@ export async function createExamRealtimeClientSecret(opts: {
       instructions,
       // Match examiner brevity (1–3 sentences); avoids runaway audio cost.
       max_output_tokens: 220,
-      reasoning: { effort: 'low' as const },
       audio: {
         input: {
           format: {
             type: 'audio/pcm',
             rate: 24000,
           },
-          noise_reduction: { type: 'far_field' as const },
+          noise_reduction: { type: 'near_field' as const },
           // Async transcription for UI + grading logs; not identical to what the audio model "heard".
           transcription: {
             model: 'whisper-1',

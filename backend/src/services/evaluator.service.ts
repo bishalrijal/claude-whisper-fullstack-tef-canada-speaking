@@ -13,8 +13,7 @@ export type { EvaluationResult };
  * Strips markdown fences and isolates the first `{` … `}` block — models often add chatter.
  */
 function extractJsonObject(raw: string): string {
-  // Prepend the '{' that was used as assistant prefill — the SDK returns only the continuation.
-  const trimmed = ('{' + raw)
+  const trimmed = raw
     .trim()
     .replace(/^```json\s*/i, '')
     .replace(/^```\s*/i, '')
@@ -28,57 +27,13 @@ function extractJsonObject(raw: string): string {
   return trimmed.slice(start, end + 1);
 }
 
-/** Parses and validates evaluator JSON — throws with context on failure (caught → 500). */
-function parseEvaluatorResponse(modelText: string): EvaluationResult {
-  const jsonStr = extractJsonObject(modelText);
-  let raw: unknown;
-  try {
-    raw = JSON.parse(jsonStr);
-  } catch (e) {
-    const msg = e instanceof Error ? e.message : String(e);
-    console.error('Evaluator JSON.parse error:', msg, 'snippet:', jsonStr.slice(0, 400));
-    throw new Error(`Evaluator JSON was not valid: ${msg}`);
-  }
-  const parsed = evaluationResultSchema.safeParse(raw);
-  if (!parsed.success) {
-    console.error('Evaluator Zod issues:', parsed.error.flatten());
-    throw new Error('Evaluator JSON did not match the expected rubric shape');
-  }
-  return parsed.data;
-}
-
 /**
- * Evaluates the full conversation after the exam ends.
- * Claude steps out of character and acts as a TEF Canada examiner scoring the candidate.
- *
- * We ask Claude to return structured JSON so we can parse it reliably into the DB schema.
+ * Static evaluation rubric — identical for every exam session.
+ * Extracted as a module-level constant so it can be cached by the API across calls.
  */
-export async function evaluateConversation(
-  history: Turn[],
-  sections: ('A' | 'B')[],
-  reason: 'timeout' | 'user_terminated',
-  candidateDelivery: DeliverySnapshot[] = [],
-): Promise<EvaluationResult> {
-
-  // Format the conversation as a readable transcript for Claude to assess.
-  const transcript = history
-    .map(t => `${t.role === 'examiner' ? 'Examinatrice' : 'Candidat'}: ${t.content}`)
-    .join('\n');
-
-  const deliveryBlock = formatDeliveryLogForEvaluator(history, candidateDelivery);
-
-  const sectionsLabel = sections.join(' et ');
-
-  const prompt = `
+const EVALUATOR_SYSTEM = `
 Tu es un examinateur certifié du TEF Canada (Test d'Évaluation de Français).
-Évalue UNIQUEMENT la performance orale du CANDIDAT (pas de l'examinatrice) dans la transcription ci-dessous.
-Section(s) évaluée(s) : Section ${sectionsLabel}.
-${reason === 'user_terminated' ? 'Note : le candidat a mis fin à l\'examen avant la fin du temps imparti — tiens-en compte dans taskFulfillment.' : ''}
-
-${deliveryBlock}
-
-TRANSCRIPTION :
-${transcript}
+Évalue UNIQUEMENT la performance orale du CANDIDAT (pas de l'examinatrice) dans la transcription fournie.
 
 DISFLUENCES ET TRANSCRIPTION ORALE :
 - La transcription provient d'un système automatique : hésitations ("euh"), allongements ("ahhh"), faux départs et réformulations peuvent apparaître comme plusieurs morceaux ou ponctuation étrange.
@@ -152,14 +107,64 @@ Exemple de forme (avec des scores fictifs — adapte à la performance réelle) 
 }
 `.trim();
 
+/** Parses and validates evaluator JSON — throws with context on failure (caught → 500). */
+function parseEvaluatorResponse(modelText: string): EvaluationResult {
+  const jsonStr = extractJsonObject(modelText);
+  let raw: unknown;
+  try {
+    raw = JSON.parse(jsonStr);
+  } catch (e) {
+    const msg = e instanceof Error ? e.message : String(e);
+    console.error('Evaluator JSON.parse error:', msg, 'snippet:', jsonStr.slice(0, 400));
+    throw new Error(`Evaluator JSON was not valid: ${msg}`);
+  }
+  const parsed = evaluationResultSchema.safeParse(raw);
+  if (!parsed.success) {
+    console.error('Evaluator Zod issues:', parsed.error.flatten());
+    throw new Error('Evaluator JSON did not match the expected rubric shape');
+  }
+  return parsed.data;
+}
+
+/**
+ * Evaluates the full conversation after the exam ends.
+ * Claude steps out of character and acts as a TEF Canada examiner scoring the candidate.
+ *
+ * We ask Claude to return structured JSON so we can parse it reliably into the DB schema.
+ */
+export async function evaluateConversation(
+  history: Turn[],
+  sections: ('A' | 'B')[],
+  reason: 'timeout' | 'user_terminated',
+  candidateDelivery: DeliverySnapshot[] = [],
+): Promise<EvaluationResult> {
+
+  const transcript = history
+    .map(t => `${t.role === 'examiner' ? 'Examinatrice' : 'Candidat'}: ${t.content}`)
+    .join('\n');
+
+  const deliveryBlock = formatDeliveryLogForEvaluator(history, candidateDelivery);
+  const sectionsLabel = sections.join(' et ');
+
+  // Dynamic per-exam content — section, optional reason note, delivery metrics, transcript.
+  const userContent = [
+    `Section(s) évaluée(s) : Section ${sectionsLabel}.`,
+    reason === 'user_terminated'
+      ? "Note : le candidat a mis fin à l'examen avant la fin du temps imparti — tiens-en compte dans taskFulfillment."
+      : '',
+    '',
+    deliveryBlock,
+    '',
+    'TRANSCRIPTION :',
+    transcript,
+  ].filter(line => line !== undefined).join('\n').trim();
+
   const response = await anthropic.messages.create({
-    model: 'claude-sonnet-4-5',
+    model: 'claude-sonnet-4-6',
     max_tokens: 1024,
-    messages: [
-      { role: 'user', content: prompt },
-      // Prefill forces the response to start with '{' — no markdown, no preamble.
-      { role: 'assistant', content: '{' },
-    ],
+    // EVALUATOR_SYSTEM is a large static constant — cached after the first call.
+    system: [{ type: 'text', text: EVALUATOR_SYSTEM, cache_control: { type: 'ephemeral' } }],
+    messages: [{ role: 'user', content: userContent }],
   });
 
   const block = response.content[0];

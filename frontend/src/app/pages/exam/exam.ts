@@ -5,7 +5,6 @@ import { Router } from '@angular/router';
 import { AttemptService } from '../../services/attempt';
 import { ExamSocketService } from '../../services/exam-socket.service';
 import { ExamRealtimeService } from '../../services/exam-realtime.service';
-import type { DeliverySnapshot } from '../../services/exam-socket.service';
 import { environment } from '../../../environments/environment';
 import { AppShellHeaderComponent } from '../../shared/components/app-shell-header/app-shell-header.component';
 import { shellActions } from '../../shared/state/shell/shell.actions';
@@ -14,9 +13,7 @@ type ExamState = 'idle' | 'listening' | 'processing' | 'ai-speaking' | 'evaluati
 type Turn = { role: 'examiner' | 'candidate'; content: string };
 
 const EXAM_DURATION_SECONDS = 5 * 60;
-const SILENCE_THRESHOLD = 12;
-const SILENCE_DURATION_MS = 1200;
-const MIN_SPEECH_FRAMES = 4;
+
 
 /** Build absolute URL for scenario images — handles `/assets/…` from API and avoids double slashes. */
 function resolveScenarioAssetUrl(pathOrUrl: string): string {
@@ -57,20 +54,8 @@ export class Exam implements OnInit, OnDestroy {
   // Display-only conversation history (server holds the authoritative copy)
   history: Turn[] = [];
 
-  private candidateDeliveryLog: DeliverySnapshot[] = [];
-
-  // Accumulates examiner sentence texts within a single turn for the display history push
-  private examinerAccumText = '';
-
-  // Internal audio/timer refs
+  // Internal timer ref
   private timerInterval: ReturnType<typeof setInterval> | null = null;
-  private audioContext: AudioContext | null = null;
-  private mediaStream: MediaStream | null = null;
-  private mediaRecorder: MediaRecorder | null = null;
-  private analyser: AnalyserNode | null = null;
-  private silenceTimer: ReturnType<typeof setTimeout> | null = null;
-  private silenceCheckInterval: ReturnType<typeof setInterval> | null = null;
-  private audioChunks: Blob[] = [];
 
   // Guards against race conditions when endExam() fires during an in-flight turn
   private examEnded = false;
@@ -78,11 +63,7 @@ export class Exam implements OnInit, OnDestroy {
   // WebSocket event subscriptions — cleaned up in ngOnDestroy
   private wsSubscription = new Subscription();
 
-  // ── Audio queue ────────────────────────────────────────────────────────────
   private playbackContext: AudioContext | null = null;
-  private audioQueue: Array<Promise<AudioBuffer>> = [];
-  private isDraining = false;
-  private drainResolve: (() => void) | null = null;
 
   ngOnInit() {
     const nav = window.history.state as { section?: 'A' | 'B' };
@@ -109,15 +90,17 @@ export class Exam implements OnInit, OnDestroy {
         this.scenarioId.set(data.scenarioId);
         this.scenarioImageBroken.set(false);
         this.scenarioImageUrl.set(resolveScenarioAssetUrl(data.scenarioImageUrl));
-        this.candidateDeliveryLog = [];
         this.history.push({ role: 'examiner', content: data.openingText });
 
         await this.playBase64Audio(data.openingAudio);
         this.startTimer();
 
         try {
-          await this.examRealtime.connect(data.realtime.clientSecret, {
+          await this.examRealtime.connect(data.realtime.clientSecret, data.realtime.expiresAt, {
             onCandidateTranscript: (text) => {
+              // Always forward to server — in-flight Whisper results can arrive a
+              // moment after examEnded is set; dropping them would lose the last turn.
+              this.examSocket.transcriptUpdate('candidate', text);
               if (this.examEnded) return;
               this.history.push({ role: 'candidate', content: text });
               this.state.set('listening');
@@ -132,8 +115,8 @@ export class Exam implements OnInit, OnDestroy {
               this.state.set('ai-speaking');
             },
             onExaminerTranscript: (text) => {
+              this.examSocket.transcriptUpdate('examiner', text);
               if (this.examEnded) return;
-              // Audio is done by the time this fires — just update the transcript display.
               this.history.push({ role: 'examiner', content: text });
             },
             onResponseDone: () => {
@@ -145,6 +128,9 @@ export class Exam implements OnInit, OnDestroy {
             onError: (message) => {
               this.error.set(message);
             },
+            onNearExpiry: () => {
+              this.examSocket.requestTokenRefresh();
+            },
           });
           if (!this.examEnded) this.state.set('listening');
         } catch {
@@ -154,34 +140,8 @@ export class Exam implements OnInit, OnDestroy {
     );
 
     this.wsSubscription.add(
-      this.examSocket.transcript$.subscribe((data) => {
-        this.history.push({ role: 'candidate', content: data.text });
-        if (data.delivery && typeof data.delivery.durationSec === 'number') {
-          this.candidateDeliveryLog.push(data.delivery);
-        }
-      }),
-    );
-
-    this.wsSubscription.add(
-      this.examSocket.examinerSentence$.subscribe((data) => {
-        this.state.set('ai-speaking');
-        this.examinerAccumText += (this.examinerAccumText ? ' ' : '') + data.sentenceText;
-        this.queueAudio(data.audio);
-      }),
-    );
-
-    this.wsSubscription.add(
-      this.examSocket.turnDone$.subscribe(async (data) => {
-        if (data.skipped) {
-          if (!this.examEnded) await this.startListening();
-          return;
-        }
-        if (this.examinerAccumText) {
-          this.history.push({ role: 'examiner', content: this.examinerAccumText });
-          this.examinerAccumText = '';
-        }
-        await this.waitForAudioDone();
-        if (!this.examEnded) await this.startListening();
+      this.examSocket.tokenRefreshed$.subscribe((data) => {
+        this.examRealtime.updateClientSecret(data.clientSecret, data.expiresAt);
       }),
     );
 
@@ -234,80 +194,18 @@ export class Exam implements OnInit, OnDestroy {
     // Exam continues in the examStarted$ subscription handler
   }
 
-  // ─── Step 2: Listen for candidate speech ─────────────────────────────────
-
-  private async startListening() {
-    this.state.set('listening');
-    this.audioChunks = [];
-
-    this.mediaStream = await navigator.mediaDevices.getUserMedia({ audio: true });
-
-    this.audioContext = new AudioContext();
-    const source = this.audioContext.createMediaStreamSource(this.mediaStream);
-    this.analyser = this.audioContext.createAnalyser();
-    this.analyser.fftSize = 512;
-    source.connect(this.analyser);
-
-    this.mediaRecorder = new MediaRecorder(this.mediaStream);
-    this.mediaRecorder.ondataavailable = (e) => {
-      if (e.data.size > 0) this.audioChunks.push(e.data);
-    };
-    this.mediaRecorder.start(100);
-
-    const dataArray = new Uint8Array(this.analyser.frequencyBinCount);
-    let speechFrameCount = 0;
-    let speechConfirmed = false;
-
-    this.silenceCheckInterval = setInterval(() => {
-      if (!this.analyser) return;
-      this.analyser.getByteFrequencyData(dataArray);
-      const avg = dataArray.reduce((a, b) => a + b, 0) / dataArray.length;
-
-      if (avg > SILENCE_THRESHOLD) {
-        speechFrameCount++;
-        if (this.silenceTimer) {
-          clearTimeout(this.silenceTimer);
-          this.silenceTimer = null;
-        }
-        if (speechFrameCount >= MIN_SPEECH_FRAMES) {
-          speechConfirmed = true;
-        }
-      } else {
-        speechFrameCount = 0;
-        if (speechConfirmed && !this.silenceTimer) {
-          this.silenceTimer = setTimeout(() => {
-            this.submitTurn();
-          }, SILENCE_DURATION_MS);
-        }
-      }
-    }, 100);
-  }
-
-  // ─── Step 3: Submit audio over WebSocket ─────────────────────────────────
-
-  private submitTurn() {
-    this.stopListening();
-    this.state.set('processing');
-    this.examinerAccumText = '';
-
-    const audioBlob = new Blob(this.audioChunks, { type: 'audio/webm' });
-    this.examSocket.submitAudio(audioBlob);
-    // Processing continues in the transcript$, examinerSentence$, turnDone$ subscriptions
-  }
-
-  // ─── Step 4: End exam (timer or user button) ─────────────────────────────
+  // ─── Step 2: End exam (timer or user button) ─────────────────────────────
 
   endExam(reason: 'timeout' | 'user_terminated') {
     this.examEnded = true;
     this.examRealtime.disconnect();
-    this.stopListening();
     this.stopTimer();
     this.state.set('evaluating');
-    this.examSocket.endExam(reason, this.history);
+    this.examSocket.endExam(reason);
     // Navigate happens in the examEnded$ subscription handler
   }
 
-  // ─── Helpers ─────────────────────────────────────────────────────────────
+  // ─── Audio helpers ────────────────────────────────────────────────────────
 
   private decodeAudio(base64: string): Promise<AudioBuffer> {
     const binary = atob(base64);
@@ -323,37 +221,6 @@ export class Exam implements OnInit, OnDestroy {
       source.connect(this.playbackContext!.destination);
       source.onended = () => resolve();
       source.start();
-    });
-  }
-
-  private queueAudio(base64: string): void {
-    this.audioQueue.push(this.decodeAudio(base64));
-    if (!this.isDraining) {
-      this.isDraining = true;
-      void this.drainAudioQueue();
-    }
-  }
-
-  private async drainAudioQueue(): Promise<void> {
-    while (this.audioQueue.length > 0) {
-      if (this.examEnded) break;
-      const buffer = await this.audioQueue.shift()!;
-      await this.playAudioBuffer(buffer);
-    }
-    this.audioQueue = [];
-    this.isDraining = false;
-    if (this.drainResolve) {
-      this.drainResolve();
-      this.drainResolve = null;
-    }
-  }
-
-  private waitForAudioDone(): Promise<void> {
-    if (!this.isDraining && this.audioQueue.length === 0) {
-      return Promise.resolve();
-    }
-    return new Promise<void>(resolve => {
-      this.drainResolve = resolve;
     });
   }
 
@@ -378,22 +245,7 @@ export class Exam implements OnInit, OnDestroy {
     }
   }
 
-  private stopListening() {
-    if (this.silenceCheckInterval) clearInterval(this.silenceCheckInterval);
-    if (this.silenceTimer) clearTimeout(this.silenceTimer);
-    this.silenceCheckInterval = null;
-    this.silenceTimer = null;
-    this.mediaRecorder?.stop();
-    this.mediaStream?.getTracks().forEach(t => t.stop());
-    this.audioContext?.close();
-    this.mediaRecorder = null;
-    this.mediaStream = null;
-    this.audioContext = null;
-    this.analyser = null;
-  }
-
   private cleanup() {
-    this.stopListening();
     this.stopTimer();
     this.playbackContext?.close();
     this.playbackContext = null;

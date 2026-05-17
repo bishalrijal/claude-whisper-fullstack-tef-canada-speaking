@@ -50,16 +50,17 @@ export async function getExaminerResponse(
   history: Turn[],
   section: 'A' | 'B',
 ): Promise<string> {
-  const messages: Anthropic.Beta.Messages.BetaMessageParam[] = history.map(turn => ({
+  const systemPrompt = buildSystemPrompt(scenario, section);
+
+  const messages: Anthropic.MessageParam[] = history.map(turn => ({
     role: turn.role === 'candidate' ? 'user' : 'assistant',
     content: turn.content,
   }));
 
-  const response = await anthropic.beta.messages.create({
-    model: 'claude-haiku-4-5-20251001',
+  const response = await anthropic.messages.create({
+    model: 'claude-sonnet-4-6',
     max_tokens: 80,
-    betas: ['prompt-caching-2024-07-31'],
-    system: [{ type: 'text', text: buildSystemPrompt(scenario, section), cache_control: { type: 'ephemeral' } }],
+    system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
     messages,
   });
 
@@ -89,17 +90,16 @@ export async function* streamExaminerSentences(
 ): AsyncGenerator<string> {
   const systemPrompt = buildSystemPrompt(scenario, section);
 
-  const messages: Anthropic.Beta.Messages.BetaMessageParam[] = history.map(turn => ({
+  const messages: Anthropic.MessageParam[] = history.map(turn => ({
     role: turn.role === 'candidate' ? 'user' : 'assistant',
     content: turn.content,
   }));
 
   let buffer = '';
 
-  const stream = anthropic.beta.messages.stream({
-    model: 'claude-haiku-4-5-20251001',
-    max_tokens: 80,
-    betas: ['prompt-caching-2024-07-31'],
+  const stream = anthropic.messages.stream({
+    model: 'claude-sonnet-4-6',
+    max_tokens: 80,  // 1-3 spoken sentences for a phone call reply
     system: [{ type: 'text', text: systemPrompt, cache_control: { type: 'ephemeral' } }],
     messages,
   });
